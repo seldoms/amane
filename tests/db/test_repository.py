@@ -69,6 +69,22 @@ class TestMediaFileRepo:
         assert fetched.has_subtitle is False
 
     @pytest.mark.asyncio(loop_scope="function")
+    async def test_create_same_path_twice_returns_existing(self, repo: Repository):
+        """同一 path 二次创建应取回已有行, 而不是撞 ix_media_files_path 抛错.
+
+        生产故障形态: watchdog(实时发现) 与 REFRESH(批量扫描) 并发登记同一文件,
+        双方 SELECT 都在对方提交前未命中, 后者撞唯一索引抛 IntegrityError;
+        REFRESH 是整批任务, 一条撞索引就判死整批(实测失败率 61%), 后续刮削
+        followup 不生成, 文件永久停在投递目录且不自愈.
+        """
+        first = await repo.create_media_file(library_id=1, path="/video/RACE-1.mp4", number="RACE-1")
+        second = await repo.create_media_file(library_id=1, path="/video/RACE-1.mp4", number="RACE-1")
+
+        assert second.id == first.id
+        rows = await repo.list_media_files(library_id=1, limit=None)
+        assert sum(1 for m in rows if m.path == "/video/RACE-1.mp4") == 1
+
+    @pytest.mark.asyncio(loop_scope="function")
     async def test_get_by_path(self, repo: Repository):
         await repo.create_media_file(library_id=1, path="/video/ABC-123.mp4", number="ABC-123")
         found = await repo.get_media_file_by_path("/video/ABC-123.mp4")

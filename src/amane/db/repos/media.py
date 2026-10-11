@@ -2,6 +2,7 @@ from collections.abc import Iterable, Sequence
 from typing import NamedTuple, Unpack
 
 from sqlalchemy import func, or_
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.sql.functions import count
 from sqlmodel import col, select
 from sqlmodel.sql.expression import SelectOfScalar
@@ -53,7 +54,20 @@ class MediaRepoMixin(RepositoryMixinBase):
             media = MediaFile(library_id=library_id, **updates)
             _apply_path_phase(media)
             session.add(media)
-            await session.commit()
+            try:
+                await session.commit()
+            except IntegrityError:
+                # 并发登记同一 path: watchdog 与 REFRESH 的 SELECT 都在对方提交前未命中,
+                # 后者撞 ix_media_files_path. REFRESH 是整批任务, 一条撞索引就判死整批
+                # (实测失败率 61%), 后续刮削 followup 不生成、文件永久停在投递目录且不自愈.
+                # path 是全局身份, 冲突收敛成"取回已提交的那行"即可: 既不制造重复行, 也不抛错.
+                await session.rollback()
+                if path is None:
+                    raise
+                existing = (await session.exec(select(MediaFile).where(col(MediaFile.path) == updates["path"]))).first()
+                if existing is None:
+                    raise
+                return existing
             await session.refresh(media)
             return media
 
